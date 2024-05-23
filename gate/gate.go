@@ -1,12 +1,13 @@
 package gate
 
 import (
-	"github.com/name5566/leaf/chanrpc"
-	"github.com/name5566/leaf/log"
-	"github.com/name5566/leaf/network"
 	"net"
 	"reflect"
 	"time"
+
+	"github.com/name5566/leaf/chanrpc"
+	"github.com/name5566/leaf/log"
+	"github.com/name5566/leaf/network"
 )
 
 type Gate struct {
@@ -21,11 +22,13 @@ type Gate struct {
 	HTTPTimeout time.Duration
 	CertFile    string
 	KeyFile     string
+	ProcessorWs network.Processor
 
 	// tcp
 	TCPAddr      string
 	LenMsgLen    int
 	LittleEndian bool
+	ProcessorTcp network.Processor
 }
 
 func (gate *Gate) Run(closeSig chan bool) {
@@ -40,7 +43,7 @@ func (gate *Gate) Run(closeSig chan bool) {
 		wsServer.CertFile = gate.CertFile
 		wsServer.KeyFile = gate.KeyFile
 		wsServer.NewAgent = func(conn *network.WSConn) network.Agent {
-			a := &agent{conn: conn, gate: gate}
+			a := &agent{conn: conn, gate: gate, severType: "websocket"}
 			if gate.AgentChanRPC != nil {
 				gate.AgentChanRPC.Go("NewAgent", a)
 			}
@@ -58,7 +61,7 @@ func (gate *Gate) Run(closeSig chan bool) {
 		tcpServer.MaxMsgLen = gate.MaxMsgLen
 		tcpServer.LittleEndian = gate.LittleEndian
 		tcpServer.NewAgent = func(conn *network.TCPConn) network.Agent {
-			a := &agent{conn: conn, gate: gate}
+			a := &agent{conn: conn, gate: gate, severType: "tcp"}
 			if gate.AgentChanRPC != nil {
 				gate.AgentChanRPC.Go("NewAgent", a)
 			}
@@ -84,9 +87,10 @@ func (gate *Gate) Run(closeSig chan bool) {
 func (gate *Gate) OnDestroy() {}
 
 type agent struct {
-	conn     network.Conn
-	gate     *Gate
-	userData interface{}
+	conn      network.Conn
+	gate      *Gate
+	severType string
+	userData  interface{}
 }
 
 func (a *agent) Run() {
@@ -97,6 +101,7 @@ func (a *agent) Run() {
 			break
 		}
 
+		//通用协议
 		if a.gate.Processor != nil {
 			msg, err := a.gate.Processor.Unmarshal(data)
 			if err != nil {
@@ -104,6 +109,32 @@ func (a *agent) Run() {
 				break
 			}
 			err = a.gate.Processor.Route(msg, a)
+			if err != nil {
+				log.Debug("route message error: %v", err)
+				break
+			}
+			continue
+		}
+
+		//tcp和websocket协议不一样
+		if a.severType == "websocket" {
+			msg, err := a.gate.ProcessorWs.Unmarshal(data)
+			if err != nil {
+				log.Debug("unmarshal message error: %v", err)
+				break
+			}
+			err = a.gate.ProcessorWs.Route(msg, a)
+			if err != nil {
+				log.Debug("route message error: %v", err)
+				break
+			}
+		} else {
+			msg, err := a.gate.ProcessorTcp.Unmarshal(data)
+			if err != nil {
+				log.Debug("unmarshal message error: %v", err)
+				break
+			}
+			err = a.gate.ProcessorTcp.Route(msg, a)
 			if err != nil {
 				log.Debug("route message error: %v", err)
 				break
@@ -122,8 +153,33 @@ func (a *agent) OnClose() {
 }
 
 func (a *agent) WriteMsg(msg interface{}) {
+	//通用协议
 	if a.gate.Processor != nil {
 		data, err := a.gate.Processor.Marshal(msg)
+		if err != nil {
+			log.Error("marshal message %v error: %v", reflect.TypeOf(msg), err)
+			return
+		}
+		err = a.conn.WriteMsg(data...)
+		if err != nil {
+			log.Error("write message %v error: %v", reflect.TypeOf(msg), err)
+		}
+		return
+	}
+
+	//tcp和websocket协议不一样
+	if a.severType == "websocket" {
+		data, err := a.gate.ProcessorWs.Marshal(msg)
+		if err != nil {
+			log.Error("marshal message %v error: %v", reflect.TypeOf(msg), err)
+			return
+		}
+		err = a.conn.WriteMsg(data...)
+		if err != nil {
+			log.Error("write message %v error: %v", reflect.TypeOf(msg), err)
+		}
+	} else {
+		data, err := a.gate.ProcessorTcp.Marshal(msg)
 		if err != nil {
 			log.Error("marshal message %v error: %v", reflect.TypeOf(msg), err)
 			return
@@ -157,4 +213,12 @@ func (a *agent) UserData() interface{} {
 
 func (a *agent) SetUserData(data interface{}) {
 	a.userData = data
+}
+
+func (a *agent) GetGate() *Gate {
+	return a.gate
+}
+
+func (a *agent) GetServerType() string {
+	return a.severType
 }
